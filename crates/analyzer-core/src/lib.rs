@@ -1,6 +1,7 @@
 pub mod base_abstractions;
 pub mod lexer;
 pub mod parser;
+pub mod plugin_manager;
 pub mod preprocessor;
 
 use std::collections::HashMap;
@@ -106,10 +107,13 @@ impl Analyzer {
 		result
 	}
 
-	pub fn diagnostics(&self, id: FileId) -> Vec<Diagnostic> {
+	pub fn diagnostics(&self, id: FileId, input: &str) -> Vec<Diagnostic> {
 		if let Some(buf) = self.filesystem().get(&id) {
+			let path = id.path(&self.db);
+
 			let mut d = lex::accumulated::<Diagnostics>(&self.db, id, *buf);
 			d.append(&mut preprocess::accumulated::<Diagnostics>(&self.db, self.fs.unwrap(), id));
+			d.append(&mut plugin_manager::get_diagnostics(id, path, input));
 			d
 		} else {
 			vec![]

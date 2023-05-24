@@ -6,13 +6,13 @@ use analyzer_abstractions::{
 	lsp_types::{
 		notification::{
 			DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument, DidOpenTextDocument,
-			DidSaveTextDocument, Exit, SetTrace,
+			DidSaveTextDocument, Exit, PublishDiagnostics, SetTrace,
 		},
 		request::{Completion, HoverRequest, Shutdown},
 		CompletionItem, CompletionItemKind, CompletionList, CompletionParams, CompletionResponse,
 		DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
 		DidOpenTextDocumentParams, DidSaveTextDocumentParams, FileChangeType, Hover, HoverContents, HoverParams,
-		MarkupContent, MarkupKind, Position, SetTraceParams, Url,
+		MarkupContent, MarkupKind, Position, PublishDiagnosticsParams, SetTraceParams, Url,
 	},
 	tracing::{error, info},
 };
@@ -146,42 +146,54 @@ async fn on_text_document_did_change(
 	params: DidChangeTextDocumentParams,
 	state: Arc<AsyncRwLock<State>>,
 ) -> HandlerResult<()> {
-	let state = state.write().await;
-	let file = state.workspaces().get_file(params.text_document.uri.clone());
-	let mut analyzer = state.analyzer.unwrap();
+	let diagnostics = {
+		let state = state.write().await;
+		let file = state.workspaces().get_file(params.text_document.uri.clone());
+		let mut analyzer = state.analyzer.unwrap();
 
-	let uri = params.text_document.uri.as_str();
-	let file_id = analyzer.file_id(uri);
-	// FIXME: potentially unnecessary allocation
-	let mut input = match analyzer.input(file_id) {
-		Some(i) => i.to_string(),
-		None => {
-			return Err(HandlerError::new_with_data("received a didChange notification for an unknown file", Some(uri)))
+		let uri = params.text_document.uri.as_str();
+		let file_id = analyzer.file_id(uri);
+		// FIXME: potentially unnecessary allocation
+		let mut input = match analyzer.input(file_id) {
+			Some(i) => i.to_string(),
+			None => {
+				return Err(HandlerError::new_with_data(
+					"received a didChange notification for an unknown file",
+					Some(uri),
+				))
+			}
+		};
+
+		for change in params.content_changes {
+			let analyzer_abstractions::lsp_types::TextDocumentContentChangeEvent { range, range_length: _, text } =
+				change;
+			if let Some(range) = range {
+				let range = lsp_range_to_byte_range(&input, range);
+				info!("replacing range {:?} of {:?} with {:?}", range, &input[range.clone()], text);
+				input.replace_range(range, &text);
+			} else {
+				input = text;
+			}
 		}
+
+		// TODO: avoid cloning
+		analyzer.update(file_id, input.clone());
+		file.open_or_update(file_id);
+		process_diagnostics(&analyzer, file_id, &input)
 	};
 
-	for change in params.content_changes {
-		let analyzer_abstractions::lsp_types::TextDocumentContentChangeEvent { range, range_length: _, text } = change;
-		if let Some(range) = range {
-			let range = lsp_range_to_byte_range(&input, range);
-			info!("replacing range {:?} of {:?} with {:?}", range, &input[range.clone()], text);
-			input.replace_range(range, &text);
-		} else {
-			input = text;
-		}
-	}
+	state
+		.read()
+		.await
+		.request_manager
+		.send_notification::<PublishDiagnostics>(PublishDiagnosticsParams {
+			uri: params.text_document.uri,
+			diagnostics,
+			version: None,
+		})
+		.await
+		.map_err(|err| HandlerError::new_with_data("Could not send diagnostics", Some(err.to_string())))?;
 
-	// TODO: avoid cloning
-	analyzer.update(file_id, input.clone());
-	file.open_or_update(file_id);
-	let diagnostics = process_diagnostics(&analyzer, file_id, &input);
-
-	// TODO: report diagnostics
-	// Ok(Some(PublishDiagnosticsParams {
-	// 	uri: params.text_document.uri,
-	// 	diagnostics,
-	// 	version: None,
-	// }))
 	Ok(())
 }
 
@@ -289,7 +301,7 @@ fn process_diagnostics(
 	file_id: FileId,
 	input: &str,
 ) -> Vec<analyzer_abstractions::lsp_types::Diagnostic> {
-	let diagnostics = analyzer.diagnostics(file_id);
+	let diagnostics = analyzer.diagnostics(file_id, input);
 
 	diagnostics
 		.into_iter()
